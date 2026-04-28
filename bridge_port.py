@@ -1,20 +1,17 @@
 import csv
 import json
-import logging
-import os
-import sys
 import time
-import traceback
 from datetime import datetime
 from pathlib import Path
 
 import requests
 import serial
+import os
 
 # =========================
 # CONFIG
 # =========================
-PORT = "COM4"
+PORT = "COM3"
 BAUD = 115200
 
 API_URL = "https://satpi-backend.onrender.com/telemetry"
@@ -22,45 +19,26 @@ API_URL = "https://satpi-backend.onrender.com/telemetry"
 LOCAL_JSON = Path("latest_telemetry.json")
 
 CSV_FIELDS = [
-    "lat", "lon", "alt", "vel", "temp", "press",
-    "alt_press", "temps_txt", "temps", "camX", "camY", "pc_rebut_ts",
+    "lat",
+    "lon",
+    "alt",
+    "vel",
+    "temp",
+    "press",
+    "alt_press",
+    "temps_txt",
+    "temps",
+    "camX",
+    "camY",
+    "pc_rebut_ts",
 ]
 
 timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 HISTORY_CSV = Path(f"GroundStationBernatelFerrer_{timestamp}.csv")
 
-SEND_TO_CLOUD    = True
-CLOUD_TIMEOUT    = 3
-LOOP_SLEEP       = 0.2
-
-# Reconexió sèrie
-RECONNECT_DELAY  = 3
-RECONNECT_MAX    = 0       # 0 = infinit
-
-# Reintents POST al cloud
-CLOUD_RETRIES    = 2
-CLOUD_RETRY_WAIT = 0.5
-
-# Posició per defecte quan no hi ha fix GPS (aeroport d'Alguaire, Lleida)
-GPS_DEFAULT_LAT = 41.72857426231821
-GPS_DEFAULT_LON =  0.5434698388285842
-GPS_DEFAULT_ALT = 229.0
-
-# =========================
-# LOGGING
-# =========================
-LOG_FILE = Path(f"bridge_log_{timestamp}.txt")
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s  %(levelname)-7s  %(message)s",
-    datefmt="%H:%M:%S",
-    handlers=[
-        logging.StreamHandler(sys.stdout),
-        logging.FileHandler(LOG_FILE, encoding="utf-8"),
-    ],
-)
-log = logging.getLogger("bridge")
+SEND_TO_CLOUD = True
+CLOUD_TIMEOUT = 3
+LOOP_SLEEP = 0.2
 
 
 # =========================
@@ -76,63 +54,38 @@ def hhmmss_a_segons(text):
 
 # =========================
 # PARSER
-# Format esperat (8 o 10 camps):
-#   lat,lon,alt,vel,temp,press,alt_press,temps[,camX,camY]
-# Exemple complet:
-#   41.564421,2.006014,508.4,8.23,19.8,999.1,507.2,00:00:06,right,center
-# Exemple sense GPS:
-#   None,None,None,None,42.22,979.24,287.14,10:40:23
+# format esperat:
+# lat,lon,alt,vel,temp,press,alt_press,temps,camX,camY
+# exemple:
+# 41.564421,2.006014,508.4,8.23,19.8,999.1,507.2,00:00:06,right,center
 # =========================
-def _pf(valor: str):
-    """Parse float tolerant: retorna None si es "None", buit o no numeric."""
-    if valor is None:
-        return None
-    v = valor.strip()
-    if v.lower() in ("none", "", "null", "nan"):
-        return None
-    try:
-        return float(v)
-    except ValueError:
-        return None
-
-
 def parse_line(line: str):
     parts = [p.strip() for p in line.strip().split(",")]
 
+    # Compat: 8 camps (sense càmera) o 10 camps (amb càmera)
     if len(parts) not in (8, 10):
         return None
 
     try:
         temps_txt = parts[7]
-        temps_seg = hhmmss_a_segons(temps_txt)
-        if temps_seg is None:
-            return None
+        temps_segons = hhmmss_a_segons(temps_txt)
 
-        lat       = _pf(parts[0])
-        lon       = _pf(parts[1])
-        alt       = _pf(parts[2])
-        vel       = _pf(parts[3])
-        temp      = _pf(parts[4])
-        press     = _pf(parts[5])
-        alt_press = _pf(parts[6])
-
-        # Si no hi ha cap sensor bàsic, no te sentit enviar
-        if temp is None and press is None and alt_press is None:
+        if temps_segons is None:
             return None
 
         return {
-            "lat":       lat       if lat       is not None else GPS_DEFAULT_LAT,
-            "lon":       lon       if lon       is not None else GPS_DEFAULT_LON,
-            "alt":       alt       if alt       is not None else GPS_DEFAULT_ALT,
-            "vel":       vel       if vel       is not None else 0.0,
-            "temp":      temp      if temp      is not None else 0.0,
-            "press":     press     if press     is not None else 0.0,
-            "alt_press": alt_press if alt_press is not None else 0.0,
+            "lat": float(parts[0]),
+            "lon": float(parts[1]),
+            "alt": float(parts[2]),
+            "vel": float(parts[3]),
+            "temp": float(parts[4]),
+            "press": float(parts[5]),
+            "alt_press": float(parts[6]),
             "temps_txt": temps_txt,
-            "temps":     float(temps_seg),
-            "camX":      str(parts[8]) if len(parts) == 10 else "center",
-            "camY":      str(parts[9]) if len(parts) == 10 else "center",
-            "_gps_real": lat is not None and lon is not None,
+            "temps": float(temps_segons),
+            # camX/camY arriben com a string ("left"/"right"/"center")
+            "camX": str(parts[8]) if len(parts) == 10 else "center",
+            "camY": str(parts[9]) if len(parts) == 10 else "center",
         }
 
     except Exception:
@@ -144,202 +97,150 @@ def parse_line(line: str):
 # =========================
 def llegir_ultima_linia(ser):
     """
-    Buida el buffer serie i retorna nomes l'ultima linia completa.
-    Evita processar dades antigues acumulades.
-    Llanca SerialException si el port es desconnecta.
+    Buida el buffer sèrie i retorna només l'última línia completa.
+    Això evita que el bridge vagi processant dades antigues acumulades.
     """
     last_line = None
+
     try:
         while ser.in_waiting > 0:
-            raw  = ser.readline()
+            raw = ser.readline()
             line = raw.decode(errors="ignore").strip()
+
             if line:
                 last_line = line
-    except serial.SerialException:
-        raise
-    except Exception as e:
-        log.warning(f"Error llegint buffer: {e}")
+
+    except Exception:
         return None
+
     return last_line
 
 
 # =========================
-# GUARDAT LOCAL (atomic)
+# GUARDAT LOCAL
 # =========================
 def guardar_local(data: dict):
-    d = {k: v for k, v in data.items() if not k.startswith("_")}
     try:
-        tmp = LOCAL_JSON.with_suffix(".tmp")
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(d, f, ensure_ascii=False)
+        tmp_path = LOCAL_JSON.with_suffix(".tmp")
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
             f.flush()
             os.fsync(f.fileno())
-        os.replace(tmp, LOCAL_JSON)
+        os.replace(tmp_path, LOCAL_JSON)
     except Exception as e:
-        log.error(f"Error guardant JSON local: {e}")
+        print("Error guardant JSON local:", e)
 
 
-# =========================
-# CSV HISTORIAL
-# =========================
 def inicialitzar_csv():
     if not HISTORY_CSV.exists():
-        try:
-            with open(HISTORY_CSV, "w", newline="", encoding="utf-8") as f:
-                csv.DictWriter(f, fieldnames=CSV_FIELDS).writeheader()
-            log.info(f"CSV creat: {HISTORY_CSV}")
-        except Exception as e:
-            log.error(f"No s'ha pogut crear el CSV: {e}")
+        with open(HISTORY_CSV, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=CSV_FIELDS)
+            writer.writeheader()
 
 
 def afegir_a_historial_csv(data: dict):
-    d = {k: v for k, v in data.items() if not k.startswith("_")}
     try:
         with open(HISTORY_CSV, "a", newline="", encoding="utf-8") as f:
-            csv.DictWriter(f, fieldnames=CSV_FIELDS).writerow(d)
+            writer = csv.DictWriter(f, fieldnames=CSV_FIELDS)
+            writer.writerow(data)
     except Exception as e:
-        log.error(f"Error escrivint CSV: {e}")
+        print("Error escrivint historial CSV:", e)
 
 
 # =========================
-# CLOUD (amb reintents)
+# CLOUD
 # =========================
-def enviar_cloud(session: requests.Session, data: dict):
+def enviar_cloud(session, data):
     if not SEND_TO_CLOUD:
         return
 
-    d = {k: v for k, v in data.items() if not k.startswith("_")}
+    try:
+        r = session.post(API_URL, json=data, timeout=CLOUD_TIMEOUT)
 
-    for intent in range(1 + CLOUD_RETRIES):
-        try:
-            r = session.post(API_URL, json=d, timeout=CLOUD_TIMEOUT)
+        if r.status_code == 200:
+            print(
+                f"OK cloud/local -> hora={data['temps_txt']} "
+                f"alt={data['alt']:.1f} vel={data['vel']:.2f}"
+            )
+        else:
+            print(f"POST ERROR {r.status_code}: {r.text[:120]}")
 
-            if r.status_code == 200:
-                gps_tag = "" if data.get("_gps_real") else " [GPS=ALGUAIRE]"
-                log.info(
-                    f"OK  hora={data['temps_txt']}  "
-                    f"lat={data['lat']:.5f} lon={data['lon']:.5f}  "
-                    f"alt={data['alt']:.1f}m  temp={data['temp']:.1f}C"
-                    f"{gps_tag}"
-                )
-                return
-
-            else:
-                log.warning(f"POST {r.status_code} (intent {intent+1}): {r.text[:160]}")
-
-        except requests.exceptions.Timeout:
-            log.warning(f"Cloud timeout (intent {intent+1}/{1+CLOUD_RETRIES})")
-        except requests.exceptions.ConnectionError:
-            log.warning(f"Cloud sense connexio (intent {intent+1}/{1+CLOUD_RETRIES})")
-        except requests.exceptions.RequestException as e:
-            log.warning(f"Cloud error: {e} (intent {intent+1})")
-
-        if intent < CLOUD_RETRIES:
-            time.sleep(CLOUD_RETRY_WAIT)
-
-    log.error("No s'ha pogut enviar al cloud despres de tots els intents.")
+    except requests.exceptions.RequestException as e:
+        print("Error xarxa cloud:", e)
 
 
 # =========================
-# CONNEXIO SERIE (amb reconexio)
-# =========================
-def obrir_port() -> serial.Serial:
-    """Intenta obrir el port serie indefinidament fins aconseguir-ho."""
-    intents = 0
-    while True:
-        try:
-            ser = serial.Serial(PORT, BAUD, timeout=0.1)
-            log.info(f"Port {PORT} obert correctament.")
-            return ser
-        except serial.SerialException as e:
-            intents += 1
-            log.warning(f"No s'ha pogut obrir {PORT} (intent {intents}): {e}")
-            if RECONNECT_MAX and intents >= RECONNECT_MAX:
-                log.error("Maxim d'intents de connexio assolit. Sortint.")
-                sys.exit(1)
-            log.info(f"Reintentant en {RECONNECT_DELAY} s...")
-            time.sleep(RECONNECT_DELAY)
-
-
-# =========================
-# MAIN LOOP
+# MAIN
 # =========================
 def main():
-    log.info("=" * 55)
-    log.info("  BRIDGE SATPI26 -- arrencant")
-    log.info(f"  Port: {PORT}  Baud: {BAUD}")
-    log.info(f"  Cloud: {API_URL}")
-    log.info(f"  Log:   {LOG_FILE}")
-    log.info("=" * 55)
-
+    ser = None
     session = requests.Session()
-    inicialitzar_csv()
 
-    ultima_hora_processada = None
-    linies_invalides_seq   = 0
+    try:
+        print(f"Connectant a {PORT}...")
+        ser = serial.Serial(PORT, BAUD, timeout=0.1)
 
-    while True:   # bucle extern: reconexio automatica
-        ser = obrir_port()
         time.sleep(2)
+
+        # Neteja inicial del buffer vell
         ser.reset_input_buffer()
-        log.info("Bridge actiu. Llegint l'ultima dada disponible.\n")
 
-        try:
-            while True:   # bucle intern: lectura normal
-                try:
-                    line = llegir_ultima_linia(ser)
-                except serial.SerialException as e:
-                    log.error(f"Port serie desconnectat: {e}. Reconectant...")
-                    break  # surt al bucle extern -> reconexio
+        inicialitzar_csv()
 
-                if not line:
-                    time.sleep(LOOP_SLEEP)
-                    continue
+        print(f"Historial CSV: {HISTORY_CSV}")
+        print("Bridge PRO actiu. Llegint només l'última dada disponible.\n")
 
-                data = parse_line(line)
+        ultima_hora_processada = None
 
-                if data is None:
-                    linies_invalides_seq += 1
-                    if linies_invalides_seq <= 3 or linies_invalides_seq % 20 == 0:
-                        log.debug(f"Linia ignorada ({linies_invalides_seq}): {line[:80]}")
-                    time.sleep(LOOP_SLEEP)
-                    continue
+        while True:
+            line = llegir_ultima_linia(ser)
 
-                linies_invalides_seq = 0
-
-                if data["temps_txt"] == ultima_hora_processada:
-                    time.sleep(LOOP_SLEEP)
-                    continue
-
-                ultima_hora_processada = data["temps_txt"]
-                data["pc_rebut_ts"]    = time.time()
-
-                guardar_local(data)
-                afegir_a_historial_csv(data)
-                enviar_cloud(session, data)
-
+            if not line:
                 time.sleep(LOOP_SLEEP)
+                continue
 
-        except KeyboardInterrupt:
-            log.info("Aturat per l'usuari (Ctrl+C).")
-            break
+            data = parse_line(line)
 
-        except Exception as e:
-            log.error(f"Error inesperat al bucle principal: {e}")
-            log.debug(traceback.format_exc())
-            log.info(f"Esperant {RECONNECT_DELAY} s abans de reconectar...")
-            time.sleep(RECONNECT_DELAY)
+            if data is None:
+                print("Línia no vàlida:", line)
+                time.sleep(LOOP_SLEEP)
+                continue
 
-        finally:
-            try:
-                if ser and ser.is_open:
-                    ser.close()
-                    log.info("Port serie tancat.")
-            except Exception:
-                pass
+            # Evita duplicats exactes
+            if data["temps_txt"] == ultima_hora_processada:
+                time.sleep(LOOP_SLEEP)
+                continue
 
-    session.close()
-    log.info("Bridge tancat correctament.")
+            ultima_hora_processada = data["temps_txt"]
+
+            # Timestamp PC real de recepció (per calcular retard real a la GS)
+            data["pc_rebut_ts"] = time.time()
+
+            # 1. Actualització local immediata
+            guardar_local(data)
+
+            # 2. Historial complet de dades processades
+            afegir_a_historial_csv(data)
+
+            # 3. Enviament cloud
+            enviar_cloud(session, data)
+
+            time.sleep(LOOP_SLEEP)
+
+    except KeyboardInterrupt:
+        print("\nAturat per l'usuari.")
+
+    except serial.SerialException as e:
+        print(f"Error port sèrie: {e}")
+
+    except Exception as e:
+        print(f"Error inesperat: {e}")
+
+    finally:
+        if ser and ser.is_open:
+            ser.close()
+        session.close()
+        print("Pont tancat correctament.")
 
 
 if __name__ == "__main__":
