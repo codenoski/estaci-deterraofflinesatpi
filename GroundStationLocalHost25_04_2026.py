@@ -25,15 +25,28 @@ ASCENS_CONFIRM_POINTS = 4
 ASCENS_THRESHOLD = 0.8
 ASCENS_GAIN_MIN = 3.0
 
-FASE_WINDOW = 10          # finestra d'avaluació de velocitat (punts)
-FASE_V_UP = 0.8           # llindar velocitat ascens (m/s)
-FASE_V_DOWN = -0.8        # llindar velocitat descens (m/s)
-FASE_LAND_V_ABS = 0.25    # velocitat màxima per considerar aterrat (m/s)
-FASE_LAND_ALTURA_MAX = 5.0
+# ── Detecció de fase (màquina d'estats) ─────────────────────────────────────
+FASE_WINDOW_VEL   = 8     # punts per calcular velocitat mitjana de fase
+FASE_WINDOW_TREND = 15    # punts per detectar tendència (apogeu, etc.)
+FASE_V_UP         = 0.6   # m/s mínim per comptar com "ascens"
+FASE_V_DOWN       = -0.6  # m/s màxim per comptar com "descens"
+FASE_V_APEX       = 0.35  # m/s: zona de transició prop de l'apogeu
+FASE_LAND_V_ABS   = 0.20  # m/s: velocitat vertical màxima per "aterrat"
+FASE_LAND_ALT_MAX = 8.0   # m d'altura guanyada màxima per considerar aterrat
+FASE_LAND_LIN_MAX = 0.40  # m/s: vel. lineal màxima per considerar aterrat
 
-FASE_CONFIRM_PUNTS = 3    # confirmacions per a transicions normals
-FASE_CONFIRM_ATERRAT = 6  # confirmacions per declarar aterratge (molt conservador)
-FASE_GAP_SEGONS = 8       # segons sense dades noves → mantén última fase coneguda
+# Confirmació de transicions (nombre de lectures consecutives)
+FASE_CONFIRM = {
+    "Esperant enlairament": 2,
+    "Ascens":               3,
+    "Apogeu":               2,
+    "Descens":              3,
+    "Aterrat":              8,   # molt conservador
+    "Vol actiu":            3,
+}
+
+FASE_GAP_SEGONS = 10   # segons sense dades → mantén última fase coneguda
+FASE_STATE_FILE = Path(__file__).parent / "fase_state.json"  # persistència entre recarregues
 
 MAP_HEIGHT = 650
 MAP_ZOOM = 18
@@ -66,6 +79,246 @@ PLOTLY_CONFIG = {
     "scrollZoom": False,
     "responsive": True,
 }
+
+# =========================
+# VALIDACIÓ DE DADES (OUTLIER DETECTION)
+# =========================
+# Límits físics absoluts: qualsevol valor fora d'aquests rangs és impossible
+# per a un CanSat i es descarta directament.
+VALID_RANG_ABSOLUT = {
+    "alt":       (-500,   50_000),   # m  — sota el mar fins estratosfera
+    "alt_press": (-500,   50_000),   # m
+    "temp":      (-90,    85),       # °C — rang físic del sensor típic
+    "press":     (1,      1200),     # hPa
+    "vel":       (0,      400),      # m/s — velocitat enviada pel mòdul GPS
+}
+
+# Màxim canvi permès entre dues lectures consecutives (per segon)
+# Valors superiors indiquen un spike / glitch de sensor
+VALID_MAX_DELTA_PER_SEG = {
+    "alt":   80.0,    # m/s — molt conservador per a ràfegues de vent fortes
+    "temp":   5.0,    # °C/s — impossible físicament canviar tan ràpid
+    "press": 30.0,    # hPa/s
+    "vel":   50.0,    # m/s per segon d'acceleració
+}
+
+# Màxima velocitat GPS horitzontal raonable (m/s)
+VALID_MAX_VEL_LINEAL      = 120.0   # ~430 km/h, impossible per a un CanSat
+# Màxim salt de posició GPS entre dues lectures (metres)
+VALID_MAX_SALT_GPS_METRES = 2_000.0 # 2 km per lectura — teleport GPS
+# Finestra de punts recents per al filtre de mediana (IQR)
+VALID_IQR_WINDOW          = 20      # últims N punts per calcular IQR
+# Multiplicador IQR: un punt és outlier si és > mediana ± k·IQR
+VALID_IQR_K               = 4.0     # conservador (un k baix rebutja massa)
+# Mínims punts a l'historial per activar el filtre IQR (necessita context)
+VALID_IQR_MIN_PUNTS       = 10
+
+# ── Registre d'alertes de validació (per mostrar a la UI) ───────────────────
+MAX_ALERTES_LOG = 50   # màxim d'alertes en memòria
+
+
+def _registrar_alerta(camp: str, valor, motiu: str, dada: dict):
+    """Afegeix una alerta al log de validació del session_state."""
+    if "validacio_alertes" not in st.session_state:
+        st.session_state.validacio_alertes = []
+    log = st.session_state.validacio_alertes
+    log.append({
+        "ts":    time.time(),
+        "camp":  camp,
+        "valor": valor,
+        "motiu": motiu,
+        "temps": dada.get("temps", "?"),
+    })
+    if len(log) > MAX_ALERTES_LOG:
+        log.pop(0)
+
+
+def _check_rang_absolut(dada: dict) -> dict:
+    """
+    Comprova que cada camp estigui dins del rang físicament possible.
+    Retorna un dict {camp: True/False} (True = vàlid).
+    """
+    resultat = {}
+    for camp, (mín, màx) in VALID_RANG_ABSOLUT.items():
+        v = dada.get(camp)
+        if v is None or not np.isfinite(float(v)):
+            resultat[camp] = False   # NaN ja és "no disponible"
+            continue
+        ok = mín <= float(v) <= màx
+        if not ok:
+            _registrar_alerta(camp, v, f"fora de rang [{mín}, {màx}]", dada)
+        resultat[camp] = ok
+    return resultat
+
+
+def _check_delta_temporal(dada: dict, historial) -> dict:
+    """
+    Compara cada camp amb l'últim valor vàlid de l'historial.
+    Si el canvi per segon supera el llindar, el valor és un spike.
+    Retorna {camp: True/False}.
+    """
+    resultat = {camp: True for camp in VALID_MAX_DELTA_PER_SEG}
+    if not historial:
+        return resultat
+
+    ant = historial[-1]
+    dt = dada.get("temps", 0) - ant.get("temps", 0)
+    if dt <= 0:
+        return resultat  # no podem calcular taxa de canvi
+
+    for camp, max_delta in VALID_MAX_DELTA_PER_SEG.items():
+        v_nou = dada.get(camp)
+        v_ant = ant.get(camp)
+        if v_nou is None or v_ant is None:
+            continue
+        if not (np.isfinite(float(v_nou)) and np.isfinite(float(v_ant))):
+            continue
+        delta_per_seg = abs(float(v_nou) - float(v_ant)) / dt
+        ok = delta_per_seg <= max_delta
+        if not ok:
+            _registrar_alerta(
+                camp, v_nou,
+                f"delta {delta_per_seg:.2f}/s > màx {max_delta}/s",
+                dada,
+            )
+        resultat[camp] = ok
+    return resultat
+
+
+def _check_gps_salt(dada: dict, historial) -> bool:
+    """
+    Detecta teleports GPS: si la posició salta més de
+    VALID_MAX_SALT_GPS_METRES entre dues lectures, descarta les coords.
+    """
+    if not historial:
+        return True
+    if not coords_valides(dada.get("lat"), dada.get("lon")):
+        return True  # NaN → coords_valides ja ho gestiona
+
+    for entrada in reversed(list(historial)):
+        if coords_valides(entrada.get("lat"), entrada.get("lon")):
+            dist = distancia_metres(
+                entrada["lat"], entrada["lon"],
+                dada["lat"],    dada["lon"],
+            )
+            if dist > VALID_MAX_SALT_GPS_METRES:
+                _registrar_alerta(
+                    "gps", f"({dada['lat']:.5f},{dada['lon']:.5f})",
+                    f"salt de {dist:.0f} m > màx {VALID_MAX_SALT_GPS_METRES} m",
+                    dada,
+                )
+                return False
+            return True  # primer punt GPS vàlid anterior trobat → OK
+    return True
+
+
+def _check_vel_lineal(dada: dict, historial) -> bool:
+    """
+    Comprova que la velocitat horitzontal implícita entre l'última posició
+    GPS vàlida i la nova no superi el màxim raonable.
+    """
+    if not historial or not coords_valides(dada.get("lat"), dada.get("lon")):
+        return True
+
+    for entrada in reversed(list(historial)):
+        if coords_valides(entrada.get("lat"), entrada.get("lon")):
+            dt = dada.get("temps", 0) - entrada.get("temps", 0)
+            if dt <= 0:
+                return True
+            dist = distancia_metres(
+                entrada["lat"], entrada["lon"],
+                dada["lat"],    dada["lon"],
+            )
+            vel = dist / dt
+            ok = vel <= VALID_MAX_VEL_LINEAL
+            if not ok:
+                _registrar_alerta(
+                    "vel_gps", vel,
+                    f"vel GPS {vel:.1f} m/s > màx {VALID_MAX_VEL_LINEAL} m/s",
+                    dada,
+                )
+            return ok
+    return True
+
+
+def _check_iqr(dada: dict, historial, camp: str) -> bool:
+    """
+    Filtre IQR sobre els últims VALID_IQR_WINDOW punts de l'historial.
+    Un valor és outlier si cau fora de [Q1 - k·IQR, Q3 + k·IQR].
+    Només s'activa quan hi ha prou punts per ser estadísticament significatiu.
+    """
+    v = dada.get(camp)
+    if v is None or not np.isfinite(float(v)):
+        return True  # NaN no és outlier, simplement absent
+
+    hist_list = list(historial)
+    if len(hist_list) < VALID_IQR_MIN_PUNTS:
+        return True  # no tenim prou context
+
+    valors = [
+        float(e[camp]) for e in hist_list[-VALID_IQR_WINDOW:]
+        if e.get(camp) is not None and np.isfinite(float(e[camp]))
+    ]
+    if len(valors) < 5:
+        return True
+
+    q1, q3 = np.percentile(valors, [25, 75])
+    iqr = q3 - q1
+    if iqr < 0.001:   # sensor pla (p. ex. temp estable) → no filtrem
+        return True
+
+    baixa = q1 - VALID_IQR_K * iqr
+    alta  = q3 + VALID_IQR_K * iqr
+    ok = baixa <= float(v) <= alta
+    if not ok:
+        _registrar_alerta(
+            camp, v,
+            f"IQR outlier: {v:.2f} fora [{baixa:.2f}, {alta:.2f}]",
+            dada,
+        )
+    return ok
+
+
+def validar_i_netejar_dada(dada: dict, historial) -> dict:
+    """
+    Punt d'entrada principal del sistema de validació.
+
+    Per a cada camp:
+      1. Rang absolut            → si falla, el camp es posa a NaN
+      2. Delta temporal (spike)  → si falla, el camp es posa a NaN
+      3. Filtre IQR estadístic   → si falla, el camp es posa a NaN
+    Per al GPS:
+      4. Teleport GPS            → si falla, lat/lon a NaN
+      5. Velocitat GPS implícita → si falla, lat/lon a NaN
+
+    Retorna la dada netejada (mai llança excepcions).
+    """
+    dada = dict(dada)  # còpia per no mutar l'original
+
+    # ── 1 + 2. Rang absolut i delta temporal ────────────────────────────────
+    rang   = _check_rang_absolut(dada)
+    delta  = _check_delta_temporal(dada, historial)
+
+    for camp in VALID_RANG_ABSOLUT:
+        if not rang.get(camp, True) or not delta.get(camp, True):
+            dada[camp] = float("nan")
+
+    # ── 3. IQR per als camps numèrics principals ─────────────────────────────
+    for camp in ("alt", "temp", "press", "alt_press"):
+        if np.isfinite(float(dada.get(camp, float("nan")))):
+            if not _check_iqr(dada, historial, camp):
+                dada[camp] = float("nan")
+
+    # Alt és obligatori; si ha estat invalidada, descartem la lectura sencera
+    if not np.isfinite(float(dada.get("alt", float("nan")))):
+        return None
+
+    # ── 4 + 5. Validació GPS ─────────────────────────────────────────────────
+    if not _check_gps_salt(dada, historial) or not _check_vel_lineal(dada, historial):
+        dada["lat"] = float("nan")
+        dada["lon"] = float("nan")
+
+    return dada
 
 # =========================
 # UI BASE
@@ -398,14 +651,40 @@ renderitzar_header()
 # =========================
 # STATE
 # =========================
+# =========================
+# PERSISTÈNCIA DE FASE
+# =========================
+_FASE_STATE_KEYS = [
+    "fase_confirmada", "fase_candidata", "fase_candidata_n",
+    "altura_base", "ha_descendit", "launch_temps",
+    "alt_max_vista", "last_data_wall_time",
+]
+
+def _carregar_fase_disc():
+    """Recupera l'estat de fase des del fitxer JSON de persistència."""
+    try:
+        if FASE_STATE_FILE.exists():
+            data = json.loads(FASE_STATE_FILE.read_text(encoding="utf-8"))
+            return data
+    except Exception:
+        pass
+    return {}
+
+def _desar_fase_disc():
+    """Desa l'estat de fase al fitxer JSON de persistència."""
+    try:
+        estat = {k: st.session_state.get(k) for k in _FASE_STATE_KEYS}
+        FASE_STATE_FILE.write_text(json.dumps(estat), encoding="utf-8")
+    except Exception:
+        pass
+
+
 def init_state():
     if "init" in st.session_state:
         return
 
     st.session_state.init = True
     st.session_state.historial = deque(maxlen=MAX_HISTORIAL)
-    st.session_state.altura_base = None
-    st.session_state.ha_descendit = False
     st.session_state.last_valid_gps = None
     st.session_state.last_json_temps = None
     st.session_state.last_json_pc_rebut_ts = None
@@ -415,18 +694,24 @@ def init_state():
     st.session_state.map_last_render_time = 0.0
     st.session_state.map_lat_render = None
     st.session_state.map_lon_render = None
-    st.session_state.launch_temps = None
-    # Màquina d'estats de fase
-    st.session_state.fase_confirmada = "Esperant enlairament"
-    st.session_state.fase_candidata = None
-    st.session_state.fase_candidata_n = 0
-    st.session_state.last_data_wall_time = 0.0
+
+    # ── Recupera estat de fase des de disc (sobreviu a recarregues) ──────────
+    persistit = _carregar_fase_disc()
+    st.session_state.fase_confirmada   = persistit.get("fase_confirmada", "Esperant enlairament")
+    st.session_state.fase_candidata    = persistit.get("fase_candidata", None)
+    st.session_state.fase_candidata_n  = persistit.get("fase_candidata_n", 0)
+    st.session_state.altura_base       = persistit.get("altura_base", None)
+    st.session_state.ha_descendit      = persistit.get("ha_descendit", False)
+    st.session_state.launch_temps      = persistit.get("launch_temps", None)
+    st.session_state.alt_max_vista     = persistit.get("alt_max_vista", None)
+    st.session_state.last_data_wall_time = persistit.get("last_data_wall_time", 0.0)
 
 
 def reset_missio():
     st.session_state.historial = deque(maxlen=MAX_HISTORIAL)
     st.session_state.altura_base = None
     st.session_state.ha_descendit = False
+    st.session_state.alt_max_vista = None
     st.session_state.last_valid_gps = None
     st.session_state.last_json_temps = None
     st.session_state.last_json_pc_rebut_ts = None
@@ -441,6 +726,12 @@ def reset_missio():
     st.session_state.fase_candidata = None
     st.session_state.fase_candidata_n = 0
     st.session_state.last_data_wall_time = 0.0
+    # Esborra persistència de disc
+    try:
+        if FASE_STATE_FILE.exists():
+            FASE_STATE_FILE.unlink()
+    except Exception:
+        pass
 
 
 init_state()
@@ -459,6 +750,17 @@ def calcular_retard_segons(pc_rebut_ts):
 # =========================
 # LECTURA JSON LOCAL
 # =========================
+def _float_o_nan(valor):
+    """Converteix a float. Retorna NaN si el valor és None, 'None', buit o no convertible."""
+    if valor is None:
+        return float("nan")
+    try:
+        v = float(valor)
+        return v
+    except (TypeError, ValueError):
+        return float("nan")
+
+
 def llegir_json_local(path):
     path = Path(path)
     if not path.exists():
@@ -480,19 +782,39 @@ def llegir_json_local(path):
         if not data or "temps" not in data:
             return None
 
+        # 'temps' és obligatori i ha de ser vàlid; la resta toleren None/null
+        temps = _float_o_nan(data.get("temps"))
+        if not np.isfinite(temps):
+            return None
+
+        # GPS: es guarden com NaN si no arriben (coords_valides() ja ho filtra)
+        lat = _float_o_nan(data.get("lat"))
+        lon = _float_o_nan(data.get("lon"))
+
+        # Sensors: NaN si manquen; els càlculs posteriors usen fillna/dropna
+        alt       = _float_o_nan(data.get("alt"))
+        vel       = _float_o_nan(data.get("vel"))
+        temp      = _float_o_nan(data.get("temp"))
+        press     = _float_o_nan(data.get("press"))
+        alt_press = _float_o_nan(data.get("alt_press"))
+
+        # Si ALT manca no podem calcular res d'altura → descartem la lectura
+        if not np.isfinite(alt):
+            return None
+
         return {
-            "lat": float(data["lat"]),
-            "lon": float(data["lon"]),
-            "alt": float(data["alt"]),
-            "vel": float(data["vel"]),
-            "temp": float(data["temp"]),
-            "press": float(data["press"]),
-            "alt_press": float(data["alt_press"]),
+            "lat":       lat,
+            "lon":       lon,
+            "alt":       alt,
+            "vel":       vel       if np.isfinite(vel)       else 0.0,
+            "temp":      temp      if np.isfinite(temp)      else float("nan"),
+            "press":     press     if np.isfinite(press)     else float("nan"),
+            "alt_press": alt_press if np.isfinite(alt_press) else alt,  # fallback a alt GPS
             "temps_txt": str(data.get("temps_txt", "")),
-            "temps": float(data["temps"]),
-            "camX": str(data.get("camX", "center")),
-            "camY": str(data.get("camY", "center")),
-            "pc_rebut_ts": float(data.get("pc_rebut_ts")) if data.get("pc_rebut_ts") is not None else None,
+            "temps":     temps,
+            "camX":      str(data.get("camX", "center")),
+            "camY":      str(data.get("camY", "center")),
+            "pc_rebut_ts": float(data["pc_rebut_ts"]) if data.get("pc_rebut_ts") is not None else None,
         }
 
     except Exception:
@@ -524,6 +846,11 @@ def processar_lectura_json(path):
     retard = calcular_retard_segons(data.get("pc_rebut_ts"))
     data["retard_s"] = float(retard) if retard is not None else 0.0
 
+    # ── Validació i neteja de dades (outlier detection) ──────────────────────
+    data = validar_i_netejar_dada(data, st.session_state.historial)
+    if data is None:
+        return   # dada completament invàlida (p.ex. alt física impossible)
+
     st.session_state.last_json_temps = data["temps"]
     st.session_state.last_json_pc_rebut_ts = data.get("pc_rebut_ts")
     st.session_state.last_json_mtime = mtime
@@ -547,6 +874,9 @@ def coords_valides(lat, lon):
         lat = float(lat)
         lon = float(lon)
     except Exception:
+        return False
+    # lat==0 & lon==0 és el sentinel que envia el bridge quan no hi ha fix GPS
+    if lat == 0.0 and lon == 0.0:
         return False
     return np.isfinite(lat) and np.isfinite(lon) and -90 <= lat <= 90 and -180 <= lon <= 180
 
@@ -604,6 +934,7 @@ def afegir_variables_altura(df):
         if (ultimes_vels > ASCENS_THRESHOLD).all() and guany_finestra >= ASCENS_GAIN_MIN:
             idx_ref = max(0, len(df) - ASCENS_CONFIRM_POINTS - 1)
             st.session_state.altura_base = float(df.iloc[idx_ref]["alt_suav"])
+            st.session_state.alt_max_vista = st.session_state.altura_base
             if st.session_state.launch_temps is None:
                 st.session_state.launch_temps = float(df.iloc[idx_ref]["temps"])
 
@@ -633,7 +964,7 @@ def calcular_velocitat_vertical(df):
 
 
 def calcular_temps_aprox_aterratge(df, altura_guanyada, fase):
-    if fase != "Descens" or altura_guanyada <= 0 or len(df) < 5:
+    if fase not in ("Descens", "Apogeu") or altura_guanyada <= 0 or len(df) < 5:
         return None
 
     vels = df["vel_calc"].tail(8)
@@ -664,45 +995,139 @@ def format_temps_aprox(segons):
     return f"{segons_restants}s"
 
 
-def obtenir_fase_intelligent(df):
-    if len(df) < 2:
-        return "Esperant enlairament"
+def _fase_raw_proposada(df, altura_guanyada, vel_vertical_mediana, v_mean_llarg):
+    """
+    Retorna la fase 'crua' (sense confirmació) basant-se en múltiples indicadors:
+      - velocitat vertical curta (mediana robusta)
+      - velocitat vertical llarga (tendència)
+      - altura guanyada
+      - si ja ha descendit
+      - si estem prop de l'apogeu (canvi de signe de velocitat)
+    """
+    fase_actual = st.session_state.fase_confirmada
+    ha_descendit = st.session_state.ha_descendit
 
-    # Velocitat vertical suavitzada (robusta a soroll i a dt variable)
-    dt = df["temps"].diff()
-    v_alt = df["alt_suav"].diff() / dt
-    v_alt = v_alt.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    # Actualitza el màxim d'altitud vist
+    alt_actual = float(df.iloc[-1]["alt_suav"])
+    if st.session_state.alt_max_vista is None or alt_actual > st.session_state.alt_max_vista:
+        st.session_state.alt_max_vista = alt_actual
 
-    w = min(FASE_WINDOW, len(df))
-    v_mean = float(v_alt.tail(w).mean())
-    v_abs_mean = float(v_alt.tail(w).abs().mean())
+    alt_max = st.session_state.alt_max_vista
+    # Quant hem baixat des del màxim?
+    caiguda_des_de_max = alt_max - alt_actual if alt_max is not None else 0.0
 
-    altura_guanyada = float(df.iloc[-1].get("altura_guanyada", 0.0))
-    vel_lineal = float(df.iloc[-1].get("vel_lineal_calc", 0.0))
-
-    # 1) Encara no tenim un enlairament clar
+    # ── Sense enlairament confirmat ──────────────────────────────────────────
     if st.session_state.altura_base is None:
-        if altura_guanyada >= ASCENS_GAIN_MIN and v_mean >= (FASE_V_UP * 0.6):
+        if vel_vertical_mediana >= FASE_V_UP * 0.7 and altura_guanyada >= 1.5:
             return "Ascens"
         return "Esperant enlairament"
 
-    # 2) Ascens / Descens (amb histeresi)
-    if v_mean >= FASE_V_UP:
-        return "Ascens"
+    vel_lineal = float(df.iloc[-1].get("vel_lineal_calc", 0.0))
 
-    if v_mean <= FASE_V_DOWN:
-        st.session_state.ha_descendit = True
+    # ── Detecció d'ATERRAT (màxima prioritat si ha descendit) ───────────────
+    if ha_descendit or fase_actual in ("Descens", "Aterrat"):
+        if (
+            abs(vel_vertical_mediana) <= FASE_LAND_V_ABS
+            and vel_lineal <= FASE_LAND_LIN_MAX
+            and altura_guanyada <= FASE_LAND_ALT_MAX
+        ):
+            return "Aterrat"
+
+    # ── DESCENS clar ─────────────────────────────────────────────────────────
+    if vel_vertical_mediana <= FASE_V_DOWN:
         return "Descens"
 
-    # 3) Després de descens, criteri d'aterratge més estricte
-    if st.session_state.ha_descendit:
-        # gairebé sense moviment vertical i sense moviment lineal
-        if altura_guanyada <= FASE_LAND_ALTURA_MAX and v_abs_mean <= FASE_LAND_V_ABS and vel_lineal <= 0.5:
-            return "Aterrat"
+    # ── APOGEU: acabem de pujar i ara som prop del cim (vel ~0, vam pujar) ──
+    # Condicions: estàvem en ascens (o apogeu), vel curta prop de 0,
+    # i hem baixat almenys 1 m des del màxim absolut.
+    if fase_actual in ("Ascens", "Apogeu", "Vol actiu"):
+        pendent_negatiu_llarg = v_mean_llarg < -0.1  # tendència baixant a escala gran
+        prop_zero = abs(vel_vertical_mediana) < FASE_V_APEX
+        if prop_zero and (caiguda_des_de_max >= 1.0 or pendent_negatiu_llarg):
+            return "Apogeu"
+
+    # ── ASCENS ───────────────────────────────────────────────────────────────
+    if vel_vertical_mediana >= FASE_V_UP:
+        return "Ascens"
+
+    # ── VOL ACTIU (en vol però sense senyal clar) ────────────────────────────
+    if altura_guanyada >= 2.0:
         return "Vol actiu"
 
-    # 4) En vol però sense pujar/baixar clarament
-    return "Vol actiu"
+    return fase_actual  # sense canvi clar → manté
+
+
+def obtenir_fase_intelligent(df):
+    """
+    Màquina d'estats de fase amb:
+      · confirmació per N lectures consecutives (evita flicker)
+      · persistència a disc (sobreviu a recarregues de pàgina)
+      · detecció d'apogeu
+      · protecció contra gap de dades
+      · transicions unidireccionals (no pot tornar enrere)
+    """
+    if len(df) < 2:
+        return st.session_state.fase_confirmada
+
+    # ── Gap de dades: si fa massa temps sense dades noves, mantén fase ──────
+    gap = time.time() - st.session_state.last_data_wall_time
+    if gap > FASE_GAP_SEGONS and st.session_state.fase_confirmada != "Esperant enlairament":
+        return st.session_state.fase_confirmada
+
+    # ── Velocitat vertical: mediana robusta (finestra curta) ─────────────────
+    dt = df["temps"].diff()
+    v_alt = (df["alt_suav"].diff() / dt).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+
+    w_curt = min(FASE_WINDOW_VEL, len(df))
+    vel_mediana = float(v_alt.tail(w_curt).median())   # robust a outliers
+
+    w_llarg = min(FASE_WINDOW_TREND, len(df))
+    v_mean_llarg = float(v_alt.tail(w_llarg).mean())
+
+    altura_guanyada = float(df.iloc[-1].get("altura_guanyada", 0.0))
+
+    # ── Fase crua proposada ──────────────────────────────────────────────────
+    fase_proposada = _fase_raw_proposada(df, altura_guanyada, vel_mediana, v_mean_llarg)
+
+    # ── Actualitza ha_descendit (flag irreversible) ──────────────────────────
+    if fase_proposada in ("Descens", "Aterrat"):
+        st.session_state.ha_descendit = True
+
+    # ── Ordre de fases (transicions unidireccionals) ─────────────────────────
+    _ORDRE = {
+        "Esperant enlairament": 0,
+        "Ascens":               1,
+        "Apogeu":               2,
+        "Vol actiu":            2,   # mateix nivell que apogeu
+        "Descens":              3,
+        "Aterrat":              4,
+    }
+    ordre_actual   = _ORDRE.get(st.session_state.fase_confirmada, 0)
+    ordre_proposta = _ORDRE.get(fase_proposada, 0)
+
+    # Permetre anar endavant o tornar a "Vol actiu" des d'"Apogeu"
+    # però mai tornar a fases anteriors a l'apogeu un cop descendit
+    if st.session_state.ha_descendit and ordre_proposta < _ORDRE["Descens"]:
+        fase_proposada = st.session_state.fase_confirmada  # bloqueja retrocés post-descens
+
+    # ── Confirmació per N lectures consecutives ──────────────────────────────
+    if fase_proposada == st.session_state.fase_candidata:
+        st.session_state.fase_candidata_n += 1
+    else:
+        st.session_state.fase_candidata    = fase_proposada
+        st.session_state.fase_candidata_n  = 1
+
+    n_necessari = FASE_CONFIRM.get(fase_proposada, 3)
+
+    if st.session_state.fase_candidata_n >= n_necessari:
+        if fase_proposada != st.session_state.fase_confirmada:
+            st.session_state.fase_confirmada  = fase_proposada
+            st.session_state.fase_candidata_n = 0  # reset comptador
+
+    # ── Desa estat a disc (per sobreviure recarregues) ────────────────────────
+    _desar_fase_disc()
+
+    return st.session_state.fase_confirmada
 
 
 def moviment_estable():
@@ -733,11 +1158,21 @@ def calcular_moviment_i_velocitat_lineal(df):
     th_gps = 0.00001
     th_alt = 0.3
 
-    mov_x = "X: cap a l'est" if delta_lon > th_gps else "X: cap a l'oest" if delta_lon < -th_gps else "X estable"
-    mov_y = "Y: cap al nord" if delta_lat > th_gps else "Y: cap al sud" if delta_lat < -th_gps else "Y estable"
-    mov_z = "Z: pujant" if delta_alt > th_alt else "Z: baixant" if delta_alt < -th_alt else "Altitud estable"
+    # Si el GPS no és vàlid en algun dels dos punts, no podem calcular moviment horitzontal
+    gps_ok = (
+        coords_valides(a["lat"], a["lon"]) and coords_valides(b["lat"], b["lon"])
+        and np.isfinite(delta_lon) and np.isfinite(delta_lat)
+    )
 
-    if coords_valides(a["lat"], a["lon"]) and coords_valides(b["lat"], b["lon"]):
+    if gps_ok:
+        mov_x = "X: cap a l'est" if delta_lon > th_gps else "X: cap a l'oest" if delta_lon < -th_gps else "X estable"
+        mov_y = "Y: cap al nord" if delta_lat > th_gps else "Y: cap al sud" if delta_lat < -th_gps else "Y estable"
+    else:
+        mov_x = "X: sense GPS"
+        mov_y = "Y: sense GPS"
+    mov_z = "Z: pujant" if np.isfinite(delta_alt) and delta_alt > th_alt else "Z: baixant" if np.isfinite(delta_alt) and delta_alt < -th_alt else "Altitud estable"
+
+    if gps_ok:
         m_lat, m_lon = metres_per_grau(a["lat"])
         dx_m = delta_lon * m_lon
         dy_m = delta_lat * m_lat
@@ -939,6 +1374,14 @@ def _html_card_fase(fase: str, retard_s: float) -> str:
             "glow":   "rgba(56,189,248,0.15)",
             "color":  "#38bdf8",
             "desc":   "En vol. Monitoritzant posició, alçada i condicions.",
+        },
+        "Apogeu": {
+            "icon": "🎯",
+            "bg":     "linear-gradient(135deg, #1a1040 0%, #2d1b69 100%)",
+            "border": "rgba(167,139,250,0.7)",
+            "glow":   "rgba(167,139,250,0.20)",
+            "color":  "#a78bfa",
+            "desc":   "Punt màxim d'altitud assolit. Preparant descens.",
         },
         "Descens": {
             "icon": "🪂",
@@ -1244,6 +1687,16 @@ def _html_card_left(hora_txt: str, retard_s: float, estat_txt: str) -> str:
         f'</div>'
     )
 
+def _fmt(valor: float, decimals: int = 1, unitat: str = "") -> str:
+    """Format segur: retorna '–' si el valor és NaN o no finit."""
+    try:
+        if not np.isfinite(float(valor)):
+            return "–"
+        return f"{valor:.{decimals}f}{(' ' + unitat) if unitat else ''}"
+    except Exception:
+        return "–"
+
+
 def _html_card_mid(
     alt: float, alt_max: float, h_guanyada: float, alt_press: float,
     temp: float, press: float, temps_aterr: str,
@@ -1253,15 +1706,15 @@ def _html_card_mid(
         f'<div style="font-size:0.65rem;font-weight:700;letter-spacing:0.14em;'
         f'color:#334155;text-transform:uppercase;margin-bottom:10px;">POSICIO I ALTITUD</div>'
         + _m4([
-            ("Altitud actual",  f"{alt:.1f} m",       "#38bdf8"),
-            ("Altitud maxima",  f"{alt_max:.1f} m",    "#f1f5f9"),
-            ("Altura guanyada", f"{h_guanyada:.1f} m", "#f1f5f9"),
-            ("Altitud pressio", f"{alt_press:.1f} m",  "#94a3b8"),
+            ("Altitud actual",  _fmt(alt, 1, "m"),       "#38bdf8"),
+            ("Altitud maxima",  _fmt(alt_max, 1, "m"),   "#f1f5f9"),
+            ("Altura guanyada", _fmt(h_guanyada, 1, "m"),"#f1f5f9"),
+            ("Altitud pressio", _fmt(alt_press, 1, "m"), "#94a3b8"),
         ])
         + _sec("CONDICIONS AMBIENTALS")
         + _m2([
-            ("Temperatura", f"{temp:.1f} °C",  "#f1f5f9"),
-            ("Pressio",     f"{press:.1f} hPa","#f1f5f9"),
+            ("Temperatura", _fmt(temp, 1, "°C"),  "#f1f5f9"),
+            ("Pressio",     _fmt(press, 1, "hPa"),"#f1f5f9"),
         ])
         + _sec("TEMPS APROX. ATERRATGE")
         + _m("Aterratge estimat", temps_aterr, "#fb923c" if temps_aterr != "–" else "#475569")
@@ -1337,7 +1790,7 @@ def renderitzar_dashboard():
     with col_mid:
         st.markdown(_html_card_mid(
             float(dada["alt"]), altura_maxima_total, altura_guanyada, float(dada["alt_press"]),
-            float(dada["temp"]), float(dada["press"]), temps_aterratge_txt,
+            dada["temp"], dada["press"], temps_aterratge_txt,
         ), unsafe_allow_html=True)
 
     with col_right:
@@ -1384,6 +1837,53 @@ def renderitzar_dashboard():
 
     st.subheader("Últimes dades")
     st.dataframe(df[TAULA_COLUMNS].tail(10), use_container_width=True)
+
+    # ── Panell de validació (alertes d'outliers) ─────────────────────────────
+    alertes = st.session_state.get("validacio_alertes", [])
+    with st.expander(
+        f"🛡️ Registre de validació de dades  —  {len(alertes)} alerta(es) total",
+        expanded=False,
+    ):
+        if not alertes:
+            st.success("Cap anomalia detectada fins ara.")
+        else:
+            NOMS_CAMP = {
+                "alt":      "Altitud GPS",
+                "alt_press":"Altitud pressió",
+                "temp":     "Temperatura",
+                "press":    "Pressió",
+                "vel":      "Velocitat (mòdul)",
+                "gps":      "Posició GPS",
+                "vel_gps":  "Velocitat GPS horitzontal",
+            }
+            files_html = ""
+            for a in reversed(alertes[-30:]):   # últimes 30
+                ts_txt = datetime.fromtimestamp(a["ts"]).strftime("%H:%M:%S")
+                nom = NOMS_CAMP.get(a["camp"], a["camp"])
+                val_txt = f"{a['valor']:.4g}" if isinstance(a["valor"], float) else str(a["valor"])
+                files_html += (
+                    f'<tr>'
+                    f'<td style="color:#64748b;white-space:nowrap">{ts_txt}</td>'
+                    f'<td style="color:#fbbf24;font-weight:600">{nom}</td>'
+                    f'<td style="color:#f87171">{val_txt}</td>'
+                    f'<td style="color:#94a3b8">{a["motiu"]}</td>'
+                    f'</tr>'
+                )
+            st.markdown(
+                f'<table style="width:100%;border-collapse:collapse;font-size:0.82rem;">'
+                f'<thead><tr>'
+                f'<th style="text-align:left;color:#475569;padding-bottom:6px">Hora</th>'
+                f'<th style="text-align:left;color:#475569">Camp</th>'
+                f'<th style="text-align:left;color:#475569">Valor rebut</th>'
+                f'<th style="text-align:left;color:#475569">Motiu del rebuig</th>'
+                f'</tr></thead>'
+                f'<tbody>{files_html}</tbody>'
+                f'</table>',
+                unsafe_allow_html=True,
+            )
+            if st.button("Esborrar historial d'alertes"):
+                st.session_state.validacio_alertes = []
+                st.rerun()
 
 
 # =========================
